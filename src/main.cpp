@@ -8,6 +8,8 @@
 class Bootloader {
 private:
     static constexpr uint32_t F_CPU = 16000000UL;
+    static constexpr uint32_t BAUD = 115200;
+    static constexpr uint16_t BAUD_PRESCALE = ((F_CPU / 16 / BAUD) - 1);
 
 public:
     static void initializeMCU() {
@@ -34,12 +36,43 @@ public:
         sei();
     }
 
+    static void initializeUART() {
+        // Set baud rate
+        UBRR0H = (BAUD_PRESCALE >> 8);
+        UBRR0L = BAUD_PRESCALE;
+
+        // Enable receiver and transmitter
+        UCSR0B = (1 << RXEN0) | (1 << TXEN0);
+
+        // Set frame format: 8 data bits, 1 stop bit, no parity
+        UCSR0C = (1 << UCSZ01) | (1 << UCSZ00);
+    }
+
+    static void uartTransmit(uint8_t data) {
+        // Wait for empty transmit buffer
+        while (!(UCSR0A & (1 << UDRE0)));
+        
+        // Put data into buffer, sends the data
+        UDR0 = data;
+    }
+
+    static uint8_t uartReceive() {
+        // Wait for data to be received
+        while (!(UCSR0A & (1 << RXC0)));
+        
+        // Get and return received data from buffer
+        return UDR0;
+    }
+
     static void run() {
         initializeMCU();
+        initializeUART();
 
         // Main bootloader logic will be implemented here
         while (true) {
-            // Infinite loop
+            // Echo received characters (for testing)
+            uint8_t received = uartReceive();
+            uartTransmit(received);
         }
     }
 };
