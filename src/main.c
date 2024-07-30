@@ -8,71 +8,137 @@
 #define BAUD 115200
 #define BAUD_PRESCALE ((F_CPU / 16 / BAUD) - 1)
 
+#define PAGESIZE SPM_PAGESIZE
+#define APP_END (BOOTLOADER_START_ADDRESS - 1)
+
+// STK500 constants
+#define STK_OK              0x10
+#define STK_FAILED          0x11
+#define STK_UNKNOWN         0x12
+#define STK_INSYNC          0x14
+#define STK_NOSYNC          0x15
+#define CRC_EOP             0x20
+
 void initialize_mcu(void) {
-    // Disable interrupts
     cli();
-
-    // Set up the watchdog timer
-    MCUSR &= ~(1 << WDRF);  // Clear the Watchdog Reset Flag
-    WDTCSR |= (1 << WDCE) | (1 << WDE);  // Enable Watchdog Timer changes
-    WDTCSR = 0x00;  // Disable Watchdog Timer
-
-    // Set up the clock
-    // The Arduino Uno uses an external 16 MHz crystal
-    // We'll set the clock prescaler to 1 (no prescaling)
-    CLKPR = (1 << CLKPCE);  // Enable change of CLKPS bits
-    CLKPR = 0;  // Set prescaler to 1 (no prescaling)
-
-    // Set up the stack pointer
-    // The stack grows downwards from the end of RAM
+    MCUSR &= ~(1 << WDRF);
+    WDTCSR |= (1 << WDCE) | (1 << WDE);
+    WDTCSR = 0x00;
+    CLKPR = (1 << CLKPCE);
+    CLKPR = 0;
     SPH = (RAMEND & 0xFF00) >> 8;
     SPL = RAMEND & 0xFF;
-
-    // Enable interrupts
     sei();
 }
 
 void initialize_uart(void) {
-    // Set baud rate
     UBRR0H = (BAUD_PRESCALE >> 8);
     UBRR0L = BAUD_PRESCALE;
-
-    // Enable receiver and transmitter
     UCSR0B = (1 << RXEN0) | (1 << TXEN0);
-
-    // Set frame format: 8 data bits, 1 stop bit, no parity
     UCSR0C = (1 << UCSZ01) | (1 << UCSZ00);
 }
 
 void uart_transmit(unsigned char data) {
-    // Wait for empty transmit buffer
     while (!(UCSR0A & (1 << UDRE0)));
-    
-    // Put data into buffer, sends the data
     UDR0 = data;
 }
 
 unsigned char uart_receive(void) {
-    // Wait for data to be received
     while (!(UCSR0A & (1 << RXC0)));
-    
-    // Get and return received data from buffer
     return UDR0;
 }
 
-int main(void) {
-    // Initialize the microcontroller
-    initialize_mcu();
+void flash_erase_page(uint32_t page) {
+    boot_page_erase(page);
+    boot_spm_busy_wait();
+}
 
-    // Initialize UART
-    initialize_uart();
-
-    // Main bootloader logic will be implemented here
-    while (1) {
-        // Echo received characters (for testing)
-        unsigned char received = uart_receive();
-        uart_transmit(received);
+void flash_write_page(uint32_t page, uint8_t *buf) {
+    for (uint16_t i = 0; i < SPM_PAGESIZE; i += 2) {
+        uint16_t w = *buf++;
+        w += (*buf++) << 8;
+        boot_page_fill(page + i, w);
     }
+    boot_page_write(page);
+    boot_spm_busy_wait();
+}
+
+uint8_t getch(void) {
+    return uart_receive();
+}
+
+void putch(uint8_t ch) {
+    uart_transmit(ch);
+}
+
+uint8_t get_hex_nibble(void) {
+    uint8_t ch = getch();
+    if (ch >= '0' && ch <= '9') return ch - '0';
+    if (ch >= 'A' && ch <= 'F') return ch - 'A' + 10;
+    if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
+    return 0;
+}
+
+uint8_t get_hex_byte(void) {
+    return (get_hex_nibble() << 4) | get_hex_nibble();
+}
+
+void bootloader(void) {
+    uint16_t address = 0;
+    uint8_t buffer[PAGESIZE];
+
+    for (;;) {
+        uint8_t ch = getch();
+
+        if (ch == ':') {
+            uint8_t len = get_hex_byte();
+            uint16_t addr = (get_hex_byte() << 8) | get_hex_byte();
+            uint8_t type = get_hex_byte();
+
+            if (type == 0x00) {  // Data record
+                for (uint8_t i = 0; i < len; i++) {
+                    if (address < APP_END) {
+                        buffer[address % PAGESIZE] = get_hex_byte();
+                        address++;
+
+                        if ((address % PAGESIZE) == 0) {
+                            flash_erase_page(address - PAGESIZE);
+                            flash_write_page(address - PAGESIZE, buffer);
+                        }
+                    } else {
+                        get_hex_byte();  // Discard data
+                    }
+                }
+            } else if (type == 0x01) {  // End of file record
+                if (address % PAGESIZE) {
+                    flash_erase_page(address - (address % PAGESIZE));
+                    flash_write_page(address - (address % PAGESIZE), buffer);
+                }
+                putch(STK_OK);
+                break;
+            }
+
+            get_hex_byte();  // Checksum (ignored)
+            putch(STK_OK);
+        } else if (ch == 'Q') {
+            putch(STK_OK);
+            break;
+        }
+    }
+}
+
+int main(void) {
+    initialize_mcu();
+    initialize_uart();
+    bootloader();
+
+    // Jump to application
+    asm volatile(
+        "clr r30\n\t"
+        "clr r31\n\t"
+        "ijmp\n\t"
+    );
+
     return 0;
 }
 
