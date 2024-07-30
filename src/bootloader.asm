@@ -9,6 +9,11 @@
 .equ MCUSR = 0x54
 .equ CLKPR = 0x61
 
+; UART constants
+.equ BAUD = 115200
+.equ F_CPU = 16000000
+.equ UBRR_VALUE = F_CPU / 16 / BAUD - 1
+
 ; Interrupt vector table
 .org 0x0000
     rjmp reset
@@ -46,9 +51,51 @@ reset:
     ; Enable interrupts
     sei
 
+    ; Initialize UART
+    rcall uart_init
+
 main_loop:
     ; Main bootloader logic will be implemented here
+    rcall uart_receive
+    rcall uart_transmit  ; Echo received character
     rjmp main_loop
+
+uart_init:
+    ; Set baud rate
+    ldi r16, high(UBRR_VALUE)
+    sts UBRR0H, r16
+    ldi r16, low(UBRR_VALUE)
+    sts UBRR0L, r16
+
+    ; Enable receiver and transmitter
+    ldi r16, (1<<RXEN0) | (1<<TXEN0)
+    sts UCSR0B, r16
+
+    ; Set frame format: 8 data bits, 1 stop bit, no parity
+    ldi r16, (1<<UCSZ01) | (1<<UCSZ00)
+    sts UCSR0C, r16
+
+    ret
+
+uart_transmit:
+    ; Wait for empty transmit buffer
+    lds r16, UCSR0A
+    sbrs r16, UDRE0
+    rjmp uart_transmit
+
+    ; Put data (r24) into buffer, sends the data
+    sts UDR0, r24
+    ret
+
+uart_receive:
+    ; Wait for data to be received
+    lds r16, UCSR0A
+    sbrs r16, RXC0
+    rjmp uart_receive
+
+    ; Get and return received data from buffer
+    lds r24, UDR0
+    ret
 
 ; Bootloader section attribute
 .section .bootloader
