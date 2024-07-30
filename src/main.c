@@ -4,6 +4,9 @@
 #include <avr/pgmspace.h>
 
 #define BOOTLOADER_START_ADDRESS 0x7000
+#define F_CPU 16000000UL
+#define BAUD 115200
+#define BAUD_PRESCALE ((F_CPU / 16 / BAUD) - 1)
 
 void initialize_mcu(void) {
     // Disable interrupts
@@ -29,13 +32,46 @@ void initialize_mcu(void) {
     sei();
 }
 
+void initialize_uart(void) {
+    // Set baud rate
+    UBRR0H = (BAUD_PRESCALE >> 8);
+    UBRR0L = BAUD_PRESCALE;
+
+    // Enable receiver and transmitter
+    UCSR0B = (1 << RXEN0) | (1 << TXEN0);
+
+    // Set frame format: 8 data bits, 1 stop bit, no parity
+    UCSR0C = (1 << UCSZ01) | (1 << UCSZ00);
+}
+
+void uart_transmit(unsigned char data) {
+    // Wait for empty transmit buffer
+    while (!(UCSR0A & (1 << UDRE0)));
+    
+    // Put data into buffer, sends the data
+    UDR0 = data;
+}
+
+unsigned char uart_receive(void) {
+    // Wait for data to be received
+    while (!(UCSR0A & (1 << RXC0)));
+    
+    // Get and return received data from buffer
+    return UDR0;
+}
+
 int main(void) {
     // Initialize the microcontroller
     initialize_mcu();
 
+    // Initialize UART
+    initialize_uart();
+
     // Main bootloader logic will be implemented here
     while (1) {
-        // Infinite loop
+        // Echo received characters (for testing)
+        unsigned char received = uart_receive();
+        uart_transmit(received);
     }
     return 0;
 }
