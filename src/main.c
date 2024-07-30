@@ -1,4 +1,3 @@
-// Arduino Uno Bootloader - C Implementation with Error Handling and Debugging
 #include <avr/io.h>
 #include <avr/interrupt.h>
 #include <avr/boot.h>
