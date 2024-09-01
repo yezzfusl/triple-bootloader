@@ -1,9 +1,28 @@
+/*
+ * Basic Arduino Bootloader 
+ * 
+ * Author: Fayssal Chokri
+ * Team: ElectroMath-Hub 
+ * Last modified: 2024-08-31
+ * 
+ * This bootloader supports:
+ * - Intel HEX file format
+ * - Watchdog timer for safety
+ * - EEPROM reading/writing
+ * - Custom commands for device info
+ * - Basic error logging
+ */
+
 #include <avr/io.h>
 #include <avr/interrupt.h>
 #include <avr/boot.h>
 #include <avr/pgmspace.h>
+#include <avr/eeprom.h>
+#include <avr/wdt.h>
 #include <util/delay.h>
+#include <string.h>
 
+// Bootloader configuration
 #define BOOTLOADER_START_ADDRESS 0x7000
 #define F_CPU 16000000UL
 #define BAUD 115200
@@ -11,6 +30,10 @@
 
 #define PAGESIZE SPM_PAGESIZE
 #define APP_END (BOOTLOADER_START_ADDRESS - 1)
+
+// Version info
+#define BOOTLOADER_VERSION_MAJOR 1
+#define BOOTLOADER_VERSION_MINOR 2
 
 // STK500 constants
 #define STK_OK              0x10
@@ -20,24 +43,67 @@
 #define STK_NOSYNC          0x15
 #define CRC_EOP             0x20
 
+// Custom commands
+#define CMD_READ_VERSION    0x41
+#define CMD_READ_FUSES      0x42
+#define CMD_WRITE_EEPROM    0x43
+#define CMD_READ_EEPROM     0x44
+
 // Error codes
 #define ERR_NONE            0
 #define ERR_VERIFY          1
 #define ERR_CHECKSUM        2
 #define ERR_INVALID_RECORD  3
+#define ERR_WRITE_FAILED    4
+#define ERR_EEPROM_WRITE    5
 
 // Timeout in milliseconds
-#define BOOTLOADER_TIMEOUT 5000
+#define BOOTLOADER_TIMEOUT 10000
+
+// Error log in EEPROM
+#define ERROR_LOG_ADDR 0x00
+#define ERROR_LOG_SIZE 16
+
+// Function prototypes
+void initialize_mcu(void);
+void initialize_uart(void);
+void uart_transmit(uint8_t data);
+uint8_t uart_receive(void);
+void flash_erase_page(uint32_t page);
+void flash_write_page(uint32_t page, uint8_t *buf);
+uint8_t flash_read_byte(uint32_t addr);
+uint8_t getch(void);
+void putch(uint8_t ch);
+uint8_t get_hex_nibble(void);
+uint8_t get_hex_byte(void);
+void send_debug_message(const char* message);
+uint8_t bootloader(void);
+void handle_custom_command(uint8_t cmd);
+void log_error(uint8_t error_code);
+
+// Global variables
+volatile uint8_t watchdog_triggered = 0;
+
+// Watchdog interrupt handler
+ISR(WDT_vect) {
+    watchdog_triggered = 1;
+}
 
 void initialize_mcu(void) {
     cli();
+    
+    // Disable watchdog
     MCUSR &= ~(1 << WDRF);
-    WDTCSR |= (1 << WDCE) | (1 << WDE);
-    WDTCSR = 0x00;
+    wdt_disable();
+    
+    // Set clock prescaler to 1 (full speed)
     CLKPR = (1 << CLKPCE);
     CLKPR = 0;
+    
+    // Initialize stack pointer
     SPH = (RAMEND & 0xFF00) >> 8;
     SPL = RAMEND & 0xFF;
+    
     sei();
 }
 
@@ -48,12 +114,12 @@ void initialize_uart(void) {
     UCSR0C = (1 << UCSZ01) | (1 << UCSZ00);
 }
 
-void uart_transmit(unsigned char data) {
+void uart_transmit(uint8_t data) {
     while (!(UCSR0A & (1 << UDRE0)));
     UDR0 = data;
 }
 
-unsigned char uart_receive(void) {
+uint8_t uart_receive(void) {
     while (!(UCSR0A & (1 << RXC0)));
     return UDR0;
 }
@@ -105,6 +171,49 @@ void send_debug_message(const char* message) {
     putch('\n');
 }
 
+void handle_custom_command(uint8_t cmd) {
+    switch (cmd) {
+        case CMD_READ_VERSION:
+            putch(BOOTLOADER_VERSION_MAJOR);
+            putch(BOOTLOADER_VERSION_MINOR);
+            break;
+        case CMD_READ_FUSES:
+            putch(boot_lock_fuse_bits_get(GET_LOW_FUSE_BITS));
+            putch(boot_lock_fuse_bits_get(GET_HIGH_FUSE_BITS));
+            putch(boot_lock_fuse_bits_get(GET_EXTENDED_FUSE_BITS));
+            putch(boot_lock_fuse_bits_get(GET_LOCK_BITS));
+            break;
+        case CMD_WRITE_EEPROM:
+            {
+                uint16_t addr = (getch() << 8) | getch();
+                uint8_t data = getch();
+                eeprom_write_byte((uint8_t*)addr, data);
+                putch(STK_OK);
+            }
+            break;
+        case CMD_READ_EEPROM:
+            {
+                uint16_t addr = (getch() << 8) | getch();
+                uint8_t data = eeprom_read_byte((uint8_t*)addr);
+                putch(data);
+            }
+            break;
+        default:
+            putch(STK_UNKNOWN);
+    }
+}
+
+void log_error(uint8_t error_code) {
+    uint8_t log[ERROR_LOG_SIZE];
+    eeprom_read_block(log, (void*)ERROR_LOG_ADDR, ERROR_LOG_SIZE);
+    
+    // Shift log entries
+    memmove(log + 1, log, ERROR_LOG_SIZE - 1);
+    log[0] = error_code;
+    
+    eeprom_write_block(log, (void*)ERROR_LOG_ADDR, ERROR_LOG_SIZE);
+}
+
 uint8_t bootloader(void) {
     uint16_t address = 0;
     uint8_t buffer[PAGESIZE];
@@ -112,9 +221,14 @@ uint8_t bootloader(void) {
     uint8_t error = ERR_NONE;
     uint32_t timeout = BOOTLOADER_TIMEOUT;
 
-    send_debug_message("Bootloader started");
+    send_debug_message("Bootloader v1.2 started");
 
-    while (timeout > 0) {
+    // Enable watchdog timer (1s timeout)
+    wdt_enable(WDTO_1S);
+
+    while (timeout > 0 && !watchdog_triggered) {
+        wdt_reset();
+
         if (UCSR0A & (1 << RXC0)) {
             uint8_t ch = getch();
 
@@ -186,6 +300,8 @@ uint8_t bootloader(void) {
                 send_debug_message("Quit command received");
                 putch(STK_OK);
                 break;
+            } else if (ch >= 0x40 && ch <= 0x4F) {
+                handle_custom_command(ch);
             }
 
             timeout = BOOTLOADER_TIMEOUT;
@@ -195,8 +311,18 @@ uint8_t bootloader(void) {
         }
     }
 
-    if (timeout == 0) {
+    if (watchdog_triggered) {
+        send_debug_message("Watchdog timeout");
+        error = ERR_WRITE_FAILED;
+    } else if (timeout == 0) {
         send_debug_message("Bootloader timed out");
+    }
+
+    // Disable watchdog timer
+    wdt_disable();
+
+    if (error != ERR_NONE) {
+        log_error(error);
     }
 
     return error;
